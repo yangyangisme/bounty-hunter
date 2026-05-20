@@ -1,0 +1,49 @@
+name: Bounty Hunter - 漏洞赏金自动化
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式"
+        required: true
+        default: "real"
+        type: choice
+        options:
+          - real
+          - test
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  bounty-hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install requests pyyaml
+      - run: |
+          python -c "
+          import yaml
+          with open('config.yaml', 'r') as f:
+              config = yaml.safe_load(f)
+          config['github']['token'] = '${{ secrets.GH_BOUNTY_TOKEN }}'
+          config['bark']['key'] = '${{ secrets.BARK_KEY }}'
+          with open('config.yaml', 'w') as f:
+              yaml.dump(config, f, allow_unicode=True)
+          "
+        env:
+          GH_BOUNTY_TOKEN: ${{ secrets.GH_BOUNTY_TOKEN }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+      - run: python main.py --real
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounty-hunter-logs
+          path: outputs/
