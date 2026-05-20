@@ -1,0 +1,51 @@
+# ============================================
+# Bounty Hunter 配置
+# ============================================
+
+# GitHub 配置
+github:
+  # ⚠️ 生产环境请使用环境变量 GITHUB_TOKEN，不要硬编码 Token
+  token: ""
+  # 每天最多提交 PR 数量（防止触发反滥用）
+  max_prs_per_day: 3
+  # 搜索语言（Python / JavaScript / TypeScript）
+  languages:
+    - Python
+    - JavaScript
+  # 搜索关键词
+  search_keywords:
+    - "SECURITY.md"
+    - "VULNERABILITY.md"
+    - "bug bounty"
+    - "inurl:SECURITY.md"
+    - "inurl:VULNERABILITY.md"
+
+# Bark 通知配置
+bark:
+  key: ""  # 复用 smart-money-monitor 的 key，后续手动填入
+  # 留空则只打印日志，不推送
+
+# 扫描策略
+scanner:
+  # 每轮最多扫描的 repo 数（避免 Rate Limit）
+  max_repos_per_run: 5
+  # 跳过已扫描过的 repo
+  skip_scanned: true
+  # 漏洞严重程度阈值（LOW / MEDIUM / HIGH / CRITICAL）
+  min_severity: MEDIUM
+  # 支持的漏洞类型
+  vuln_types:
+    - hardcoded_secret     # 硬编码密钥/密码
+    - eval_usage           # eval() 使用
+    - sql_injection         # SQL 注入风险
+    - xss                   # XSS 风险
+    - path_traversal        # 路径遍历
+    - insecure_random       # 不安全的随机数
+    - hardcoded_url         # 硬编码敏感 URL
+
+# 日志配置
+logging:
+  level: INFO
+  file: "outputs/bounty_hunter.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
