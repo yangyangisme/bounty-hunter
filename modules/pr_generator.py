@@ -1,14 +1,16 @@
 """
-PR 生成模块
-通过 GitHub API 创建修复分支、提交修复代码、创建 Draft PR
-测试模式：输出 PR 预览而不实际调用 API
+PR 生成模块 v2
+Fork-then-PR 流程：
+1. Fork 目标仓库到你的账户
+2. 在 fork 上创建分支
+3. 提交修复文件
+4. 创建从 fork 到原仓库的 PR
 """
 
 import requests
 import base64
 import time
 import json
-import os
 
 
 # ==================== 修复代码模板 ====================
@@ -171,7 +173,6 @@ app.run(debug=debug)
     },
 }
 
-# 默认修复模板
 DEFAULT_FIX = {
     "python": "# 建议修复此处代码，参考安全最佳实践",
     "javascript": "// 建议修复此处代码，参考安全最佳实践",
@@ -179,26 +180,19 @@ DEFAULT_FIX = {
 
 
 def generate_fix_code(vuln_type, matched, language):
-    """根据漏洞类型和语言生成修复代码"""
     lang_key = language.lower() if language.lower() in ["python", "javascript", "typescript"] else "javascript"
-
-    # 统一语言映射
     if lang_key == "typescript":
         lang_key = "javascript"
-
     if vuln_type in FIX_TEMPLATES:
         template = FIX_TEMPLATES[vuln_type].get(lang_key, FIX_TEMPLATES[vuln_type].get("python", ""))
     else:
         template = DEFAULT_FIX.get(lang_key, "")
-
     if not template:
         return DEFAULT_FIX.get(lang_key, "请手动修复此漏洞")
-
     return template.format(matched=matched)
 
 
 def build_pr_body(repo, findings):
-    """构建 PR 描述"""
     vuln_counts = {}
     for f in findings:
         t = f["type"]
@@ -209,20 +203,18 @@ def build_pr_body(repo, findings):
         "",
         "## 发现摘要",
         "",
-        f"| 漏洞类型 | 数量 |",
-        f"|----------|------|",
+        "| 漏洞类型 | 数量 |",
+        "|----------|------|",
     ]
     for vtype, count in vuln_counts.items():
-        cwe = findings[0]["cwe_id"] if any(f["type"] == vtype for f in findings) else "N/A"
-        body_lines.append(f"| {vtype} ({cwe}) | {count} |")
+        body_lines.append(f"| {vtype} | {count} |")
 
     body_lines.extend([
         "",
-        "## 漏洞详情",
+        "## 漏洞详情（Top 5）",
         "",
     ])
-
-    for f in findings[:5]:  # 最多显示5个
+    for f in findings[:5]:
         body_lines.extend([
             f"### [{f['severity']}] {f['description']} — {f['file']}:{f['line']}",
             "",
@@ -239,7 +231,6 @@ def build_pr_body(repo, findings):
             "```",
             "",
             "---",
-            "",
         ])
 
     body_lines.extend([
@@ -253,13 +244,10 @@ def build_pr_body(repo, findings):
         "",
         "贡献此修复即表示您同意将代码按项目原有许可证发布。",
     ])
-
     return "\n".join(body_lines)
 
 
 class PRGenerator:
-    """PR 生成器"""
-
     BASE_URL = "https://api.github.com"
 
     def __init__(self, config, logger, test_mode=False):
@@ -268,6 +256,9 @@ class PRGenerator:
         self.test_mode = test_mode
         self.token = config.get("github", {}).get("token", "")
         self.max_prs = config.get("github", {}).get("max_prs_per_day", 3)
+        # 缓存：已 fork 的仓库 -> fork 后的完整名称 "username/repo"
+        self._fork_cache = {}
+        self._username = None  # 缓存当前用户
 
     def _headers(self):
         return {
@@ -276,10 +267,70 @@ class PRGenerator:
             "User-Agent": "BountyHunter/1.0",
         }
 
-    def _create_branch(self, owner, name, base_branch="main"):
-        """创建新分支"""
-        # 先获取默认分支
-        url = f"{self.BASE_URL}/repos/{owner}/{name}"
+    def _get_username(self):
+        """获取当前认证用户的用户名"""
+        if self._username:
+            return self._username
+        try:
+            resp = requests.get(f"{self.BASE_URL}/user", headers=self._headers(), timeout=15)
+            if resp.status_code == 200:
+                self._username = resp.json().get("login", "")
+                return self._username
+        except Exception:
+            pass
+        return ""
+
+    def _fork_repo(self, owner, name):
+        """Fork 目标仓库到当前用户账户"""
+        my_name = self._get_username()
+        if not my_name:
+            self.logger.error("  无法获取当前用户名，Fork 失败")
+            return None, None
+
+        # 检查是否已 fork（通过查询自己的仓库列表）
+        cache_key = f"{owner}/{name}"
+        if cache_key in self._fork_cache:
+            fork_name = self._fork_cache[cache_key]
+            self.logger.info(f"  使用已缓存的 fork: {fork_name}")
+            return my_name, name  # fork 名称 = 原名（在当前用户下）
+
+        # 检查该仓库是否已经被当前用户 fork
+        try:
+            check_url = f"{self.BASE_URL}/repos/{my_name}/{name}"
+            resp = requests.get(check_url, headers=self._headers(), timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                # 如果 parent.owner.login == owner，说明是我们的 fork
+                if data.get("parent", {}).get("owner", {}).get("login") == owner:
+                    self.logger.info(f"  已存在 fork: {my_name}/{name}")
+                    self._fork_cache[cache_key] = f"{my_name}/{name}"
+                    return my_name, name
+        except Exception:
+            pass
+
+        # 执行 Fork
+        self.logger.info(f"  正在 Fork {owner}/{name} 到 {my_name}/{name}...")
+        fork_url = f"{self.BASE_URL}/repos/{owner}/{name}/forks"
+        resp = requests.post(fork_url, headers=self._headers(), json={}, timeout=30)
+
+        if resp.status_code in (200, 201, 202):
+            self.logger.info(f"  Fork 成功: {my_name}/{name}")
+            self._fork_cache[cache_key] = f"{my_name}/{name}"
+            return my_name, name
+        elif resp.status_code == 202:
+            # 异步创建，等待一下再查
+            self.logger.info("  Fork 异步创建中，等待 5 秒...")
+            time.sleep(5)
+            self._fork_cache[cache_key] = f"{my_name}/{name}"
+            return my_name, name
+        else:
+            self.logger.error(f"  Fork 失败: {resp.status_code} {resp.text[:100]}")
+            return None, None
+
+    def _create_branch(self, fork_owner, name, base_branch="main"):
+        """在 fork 上创建新分支"""
+        # 获取默认分支
+        url = f"{self.BASE_URL}/repos/{fork_owner}/{name}"
         resp = requests.get(url, headers=self._headers(), timeout=15)
         if resp.status_code == 200:
             default_branch = resp.json().get("default_branch", base_branch)
@@ -287,31 +338,29 @@ class PRGenerator:
             default_branch = base_branch
 
         # 获取最新 commit SHA
-        ref_url = f"{self.BASE_URL}/repos/{owner}/{name}/git/ref/heads/{default_branch}"
+        ref_url = f"{self.BASE_URL}/repos/{fork_owner}/{name}/git/ref/heads/{default_branch}"
         resp = requests.get(ref_url, headers=self._headers(), timeout=15)
         if resp.status_code != 200:
-            self.logger.error(f"获取分支信息失败: {resp.text}")
+            self.logger.error(f"  获取分支 SHA 失败: {resp.text[:80]}")
             return None
         sha = resp.json()["object"]["sha"]
 
-        # 创建新分支
-        branch_name = f"bounty-hunter/fix-{int(time.time())}"
-        create_url = f"{self.BASE_URL}/repos/{owner}/{name}/git/refs"
-        data = {
-            "ref": f"refs/heads/{branch_name}",
-            "sha": sha,
-        }
+        # 创建分支
+        branch_name = f"bounty-hunter-fix-{int(time.time())}"
+        create_url = f"{self.BASE_URL}/repos/{fork_owner}/{name}/git/refs"
+        data = {"ref": f"refs/heads/{branch_name}", "sha": sha}
         resp = requests.post(create_url, headers=self._headers(), json=data, timeout=15)
         if resp.status_code in (201, 200):
             self.logger.info(f"  分支创建成功: {branch_name}")
             return branch_name
         else:
-            self.logger.error(f"  分支创建失败: {resp.text}")
+            self.logger.error(f"  分支创建失败: {resp.text[:80]}")
             return None
 
-    def _submit_file(self, owner, name, branch, path, content, message):
-        """提交单个文件"""
-        url = f"{self.BASE_URL}/repos/{owner}/{name}/contents/{path}"
+    def _submit_file(self, fork_owner, name, branch, path, content, message):
+        """在 fork 上提交文件"""
+        url = f"{self.BASE_URL}/repos/{fork_owner}/{name}/contents/{path}"
+        encoded = requests.utils.quote(path, safe='/') if hasattr(requests, 'utils') else path
         data = {
             "message": message,
             "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
@@ -322,7 +371,7 @@ class PRGenerator:
 
     def create_pr(self, repo, findings):
         """
-        创建修复 PR
+        Fork → 创建分支 → 提交修复 → 创建 PR
         返回 PR URL 或 None
         """
         if self.test_mode:
@@ -330,42 +379,52 @@ class PRGenerator:
                 "repo": f"{repo['owner']}/{repo['name']}",
                 "title": f"[Security Fix] {repo['name']}: {len(findings)} vulnerabilities",
                 "findings_count": len(findings),
-                "severities": list(set(f["severity"] for f in findings)),
                 "note": "测试模式：未实际调用 GitHub API",
             }
-            self.logger.info(f"  [MOCK PR] {json.dumps(pr_preview, ensure_ascii=False)}")
+            self.logger.info(f"  [MOCK] {json.dumps(pr_preview, ensure_ascii=False)}")
             return f"MOCK: {repo['owner']}/{repo['name']}"
 
         owner = repo["owner"]
         name = repo["name"]
 
-        # 创建分支
-        branch = self._create_branch(owner, name)
+        # Step 1: Fork 仓库
+        my_name = self._get_username()
+        if not my_name:
+            self.logger.error("  无法获取用户信息，请检查 Token 权限")
+            return None
+
+        fork_owner, fork_name = self._fork_repo(owner, name)
+        if not fork_owner:
+            return None
+
+        # Step 2: 创建分支
+        branch = self._create_branch(fork_owner, fork_name)
         if not branch:
             return None
 
-        # 提交修复文件
+        # Step 3: 提交修复报告
         fix_content = build_pr_body(repo, findings)
-        fix_path = f"security-fix-{int(time.time())}.md"
-
+        fix_path = f"SECURITY_FIX_{int(time.time())}.md"
         success = self._submit_file(
-            owner, name, branch,
+            fork_owner, fork_name, branch,
             fix_path,
             fix_content,
-            f"docs: add security vulnerability fix report ({len(findings)} issues)"
+            f"docs: add security vulnerability fix report ({len(findings)} issues found)"
         )
         if not success:
             self.logger.error("  文件提交失败")
             return None
 
-        # 创建 PR
+        # Step 4: 创建 PR
+        # head 格式：fork_owner:branch_name（从 fork 提 PR 到原仓库）
+        head = f"{fork_owner}:{branch}"
         pr_url = f"{self.BASE_URL}/repos/{owner}/{name}/pulls"
         pr_data = {
             "title": f"[Security Fix] {name}: {len(findings)} vulnerabilities detected",
             "body": build_pr_body(repo, findings),
-            "head": branch,
-            "base": "main",
-            "draft": True,  # 草稿 PR，需要你手动 publish
+            "head": head,
+            "base": repo.get("default_branch", "main"),
+            "draft": False,  # 直接创建正式 PR，方便维护者直接 review
         }
         resp = requests.post(pr_url, headers=self._headers(), json=pr_data, timeout=15)
 
@@ -376,5 +435,5 @@ class PRGenerator:
             self.logger.info(f"  PR 创建成功: #{pr_number} {pr_html_url}")
             return pr_html_url
         else:
-            self.logger.error(f"  PR 创建失败: {resp.status_code} {resp.text}")
+            self.logger.error(f"  PR 创建失败: {resp.status_code} {resp.text[:100]}")
             return None
