@@ -28,7 +28,8 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: pip install requests pyyaml
-      - run: |
+      - name: 配置密钥并运行
+        run: |
           python -c "
           import yaml
           with open('config.yaml', 'r') as f:
@@ -38,10 +39,10 @@ jobs:
           with open('config.yaml', 'w') as f:
               yaml.dump(config, f, allow_unicode=True)
           "
+          python main.py --${{ inputs.mode || 'real' }}
         env:
           GH_BOUNTY_TOKEN: ${{ secrets.GH_BOUNTY_TOKEN }}
           BARK_KEY: ${{ secrets.BARK_KEY }}
-      - run: python main.py --real
       - if: always()
         uses: actions/upload-artifact@v4
         with:
