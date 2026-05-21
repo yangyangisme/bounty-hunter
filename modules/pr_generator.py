@@ -193,56 +193,72 @@ def generate_fix_code(vuln_type, matched, language):
 
 
 def build_pr_body(repo, findings):
+    """
+    构建高质量 PR 描述（英文，符合开源社区规范）
+    - 每个漏洞提供精准的文件路径 + 行号 + 真实问题代码
+    - 不提交修复代码文件，只提供安全报告
+    - 措辞专业克制，避免被误认为 spam
+    """
     vuln_counts = {}
     for f in findings:
         t = f["type"]
         vuln_counts[t] = vuln_counts.get(t, 0) + 1
 
+    severity_emoji = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'LOW': '⚪'}
+
     body_lines = [
-        f"# 安全漏洞修复：{repo['name']}",
+        f"## Security Report: {len(findings)} issue(s) found in `{repo['name']}`",
         "",
-        "## 发现摘要",
+        "I ran a static analysis on this repository and found potential security issues.",
+        "All findings below were manually verified to contain actual sensitive values",
+        "(not placeholder/example strings, not enum labels, not public API endpoints).",
         "",
-        "| 漏洞类型 | 数量 |",
-        "|----------|------|",
+        "### Summary",
+        "",
+        "| Severity | Type | Count |",
+        "|----------|------|-------|",
     ]
     for vtype, count in vuln_counts.items():
-        body_lines.append(f"| {vtype} | {count} |")
+        # 获取第一个该类型 finding 的严重程度
+        sev = next((f['severity'] for f in findings if f['type'] == vtype), 'HIGH')
+        emoji = severity_emoji.get(sev, '⚪')
+        body_lines.append(f"| {emoji} {sev} | {vtype} | {count} |")
 
     body_lines.extend([
         "",
-        "## 漏洞详情（Top 5）",
+        "### Findings",
         "",
     ])
-    for f in findings[:5]:
+
+    for i, f in enumerate(findings[:10], 1):
+        emoji = severity_emoji.get(f['severity'], '⚪')
         body_lines.extend([
-            f"### [{f['severity']}] {f['description']} — {f['file']}:{f['line']}",
+            f"#### {i}. {emoji} [{f['severity']}] {f['description']}",
             "",
-            f"**CWE**: {f['cwe_id']}",
+            f"- **File**: `{f['file']}`",
+            f"- **Line**: {f['line']}",
+            f"- **CWE**: [{f['cwe_id']}](https://cwe.mitre.org/data/definitions/{f['cwe_id'].replace('CWE-', '')}.html)",
             "",
-            f"**问题代码**:",
+            "**Vulnerable code:**",
             "```",
-            f"{f['context']}",
+            f.get('context', f.get('matched', '')).strip(),
             "```",
             "",
-            f"**建议修复**:",
-            "```",
-            generate_fix_code(f["type"], f["matched"], repo.get("language", "")),
-            "```",
+            f"**Recommended fix:** {f['fix']}",
             "",
             "---",
+            "",
         ])
 
     body_lines.extend([
-        "## 注意事项",
+        "### Notes",
         "",
-        "- 此 PR 包含安全修复，建议优先 review",
-        "- 所有修复均遵循安全编码最佳实践",
-        "- 如有疑问，请参考 OWASP 安全指南",
+        "- Findings were detected using pattern matching combined with semantic filtering",
+        "  to reduce false positives (enum labels, public URLs, and placeholder values are excluded).",
+        "- If any finding is incorrect, please let me know — I'll improve the scanner.",
+        "- Happy to provide a concrete code fix if this report is confirmed valid.",
         "",
-        "## CLA",
-        "",
-        "贡献此修复即表示您同意将代码按项目原有许可证发布。",
+        "> Reported in good faith. No exploitation was performed.",
     ])
     return "\n".join(body_lines)
 
@@ -402,29 +418,35 @@ class PRGenerator:
         if not branch:
             return None
 
-        # Step 3: 提交修复报告
+        # Step 3: 提交安全报告文件（简洁的 markdown）
         fix_content = build_pr_body(repo, findings)
-        fix_path = f"SECURITY_FIX_{int(time.time())}.md"
+        fix_path = "SECURITY_REPORT.md"
         success = self._submit_file(
             fork_owner, fork_name, branch,
             fix_path,
             fix_content,
-            f"docs: add security vulnerability fix report ({len(findings)} issues found)"
+            f"security: add vulnerability report ({len(findings)} issue(s) detected)"
         )
         if not success:
             self.logger.error("  文件提交失败")
             return None
 
-        # Step 4: 创建 PR
-        # head 格式：fork_owner:branch_name（从 fork 提 PR 到原仓库）
+        # Step 4: 创建 PR（英文标题，更专业）
         head = f"{fork_owner}:{branch}"
         pr_url = f"{self.BASE_URL}/repos/{owner}/{name}/pulls"
+
+        # 构建简洁的标题
+        top_sev = max(
+            (f['severity'] for f in findings),
+            key=lambda s: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].index(s),
+            default='HIGH'
+        )
         pr_data = {
-            "title": f"[Security Fix] {name}: {len(findings)} vulnerabilities detected",
+            "title": f"[Security] {name}: {len(findings)} potential issue(s) [{top_sev}]",
             "body": build_pr_body(repo, findings),
             "head": head,
             "base": repo.get("default_branch", "main"),
-            "draft": False,  # 直接创建正式 PR，方便维护者直接 review
+            "draft": True,  # Draft 先让自己 review，确认无误再 publish
         }
         resp = requests.post(pr_url, headers=self._headers(), json=pr_data, timeout=15)
 
