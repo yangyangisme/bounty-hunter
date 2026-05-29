@@ -1,8 +1,10 @@
-name: Bounty Hunter - 漏洞赏金自动化
+name: Bounty Hunter - GitHub 漏洞赏金自动化
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"
+  # 每 6 小时运行一次（已关闭定时触发，避免消耗 Actions 额度）
+  # schedule:
+  #   - cron: "0 */6 * * *"
+  # 也可以手动触发
   workflow_dispatch:
     inputs:
       mode:
@@ -16,6 +18,9 @@ on:
 
 env:
   PYTHON_VERSION: "3.11"
+  # GitHub Token（自动注入，不需要手动设置）
+  # GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # BARK_KEY: ${{ secrets.BARK_KEY }}
 
 jobs:
   bounty-hunt:
@@ -23,28 +28,79 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - run: pip install requests pyyaml
-      - name: 配置密钥并运行
+
+      - name: 安装依赖
         run: |
+          pip install requests pyyaml
+
+      - name: 配置密钥
+        run: |
+          # 在 config.yaml 中填入 GitHub Token 和 Bark Key（从 Secrets 注入）
           python -c "
           import yaml
           with open('config.yaml', 'r') as f:
               config = yaml.safe_load(f)
+          
+          # 注入 GitHub Token（使用 GITHUB_TOKEN 或 secrets.GITHUB_TOKEN）
           config['github']['token'] = '${{ secrets.GH_BOUNTY_TOKEN }}'
+          
+          # 注入 Bark Key
           config['bark']['key'] = '${{ secrets.BARK_KEY }}'
+          
           with open('config.yaml', 'w') as f:
               yaml.dump(config, f, allow_unicode=True)
           "
-          python main.py --${{ inputs.mode || 'real' }}
         env:
           GH_BOUNTY_TOKEN: ${{ secrets.GH_BOUNTY_TOKEN }}
           BARK_KEY: ${{ secrets.BARK_KEY }}
-      - if: always()
+
+      - name: 运行 Bounty Hunter
+        id: run
+        run: |
+          MODE="${{ inputs.mode || 'real' }}"
+          if [ "$MODE" = "test" ]; then
+            python main.py
+          else
+            python main.py --real
+          fi
+        continue-on-error: true
+
+      - name: 上传扫描日志
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bounty-hunter-logs
           path: outputs/
+          retention-days: 7
+
+      - name: 推送完成通知（Bark）
+        if: always()
+        run: |
+          python -c "
+          import requests, urllib.parse, os
+          
+          bark_key = os.environ.get('BARK_KEY', '')
+          if not bark_key:
+            print('BARK_KEY not set, skip notification')
+            exit(0)
+          
+          status = '成功' if ${{ steps.run.outcome == 'success' }} else '失败'
+          title = urllib.parse.quote('Bounty Hunter 运行${{ steps.run.outcome == 'success' && '成功' || '失败' }}')
+          body = urllib.parse.quote('扫描完成，请检查 GitHub Actions 日志')
+          url = f'https://api.day.app/{bark_key}/{title}?body={body}'
+          
+          try:
+            r = requests.get(url, timeout=10)
+            print(f'Bark notification sent: {r.status_code}')
+          except Exception as e:
+            print(f'Bark notification failed: {e}')
+          "
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
